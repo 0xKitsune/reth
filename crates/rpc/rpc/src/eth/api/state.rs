@@ -96,10 +96,9 @@ where
             _ => false,
         };
 
-        // TODO: remove when HistoricalStateProviderRef::proof is implemented
-        if !is_latest_block {
-            return Err(EthApiError::InvalidBlockRange)
-        }
+        //TODO: If the block is a historical block, unwind state
+
+        //TODO: implement HistoricalStateProviderRef::proof
 
         let this = self.clone();
         self.inner

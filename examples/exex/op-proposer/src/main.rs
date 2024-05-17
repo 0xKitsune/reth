@@ -36,15 +36,18 @@ async fn init_exex<Node: FullNodeComponents>(
     let mut db: L2OutputDb = L2OutputDb::new(connection);
     db.initialize()?;
 
+    // Initialize the l2 output oracle and the OpProposer
     let l2_output_oracle =
         Arc::new(L2OutputOracle::new(config.l2_output_oracle, l1_provider.clone()));
 
     let op_proposer =
         OpProposer::new(l1_provider, config.rollup_rpc, config.l2_to_l1_message_passer);
 
+    // Initialize the TxManager to manage pending transactions
     let (pending_tx, pending_rx) = tokio::sync::mpsc::channel::<(u64, PendingTransaction)>(100);
     let mut transaction_manager = TxManager::new(l2_output_oracle.clone(), pending_tx);
 
+    // Spawn the OpProposer and TxManager, proposing L2 outputs to L1
     let op_proposer_fut = async move {
         tokio::select! {
             _ = transaction_manager.run(pending_rx) => {

@@ -111,11 +111,9 @@ where
         mut transaction_manager: TxManager<T, N, P>,
     ) -> eyre::Result<()> {
         let l2_provider = ctx.provider().clone();
-        let l1_provider = self.l1_provider.clone();
         let rollup_provider = Arc::new(ProviderBuilder::new().with_recommended_fillers().on_http(
             self.rollup_provider.parse().expect("Could not parse rollup provider endpoint"),
         ));
-        let l2_to_l1_message_passer = self.l2_to_l1_message_passer;
 
         while let Some(notification) = ctx.notifications.recv().await {
             info!(?notification, "Received ExEx notification");
@@ -140,8 +138,8 @@ where
                     l2_output_db.get_l2_output(target_block)?
                 }
                 Ordering::Equal => {
-                    let l1_block_attr = get_l1_block_attributes(&l1_provider.clone()).await?;
-                    let proof = l2_provider.latest()?.proof(l2_to_l1_message_passer, &[])?;
+                    let l1_block_attr = get_l1_block_attributes(&self.l1_provider).await?;
+                    let proof = l2_provider.latest()?.proof(self.l2_to_l1_message_passer, &[])?;
 
                     let l2_output = L2Output {
                         output_root: proof.storage_root,

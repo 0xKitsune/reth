@@ -53,7 +53,7 @@ where
         self.pending_transactions.lock().insert(l2_output.l2_block_number);
 
         // Submit a transaction to propose the L2Output to the L2OutputOracle contract
-        let transport_result = l2_output_oracle
+        let pending_transaction = l2_output_oracle
             .proposeL2Output(
                 l2_output.output_root,
                 U256::from(l2_output.l2_block_number),
@@ -65,7 +65,7 @@ where
             .register()
             .await?;
 
-        self.pending_transaction_tx.send((l2_output.l2_block_number, transport_result)).await?;
+        self.pending_transaction_tx.send((l2_output.l2_block_number, pending_transaction)).await?;
 
         info!(
             output_root = ?l2_output.output_root,
@@ -89,7 +89,7 @@ where
 
         let init_bond = dispute_game_factory.initBonds(game_type).call().await?;
 
-        let transport_result = dispute_game_factory
+        let pending_transaction = dispute_game_factory
             .create(game_type, root_claim, Bytes::new())
             .value(U256::from(init_bond._0))
             .send()
@@ -97,7 +97,7 @@ where
             .register()
             .await?;
 
-        self.pending_transaction_tx.send((l2_block_number, transport_result)).await?;
+        self.pending_transaction_tx.send((l2_block_number, pending_transaction)).await?;
         info!(?game_type, ?root_claim, ?l2_block_number, "Creating Dispute Game");
 
         Ok(())

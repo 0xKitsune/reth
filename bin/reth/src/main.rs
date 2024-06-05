@@ -6,7 +6,10 @@
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(all(feature = "optimism", not(test)))]
-compile_error!("Cannot build the `reth` binary with the `optimism` feature flag enabled. Did you mean to build `op-reth`?");
+compile_error!(
+    "Cannot build the `reth` binary with the `optimism` feature flag enabled. Did you
+mean to build `op-reth`?"
+);
 
 #[cfg(not(feature = "optimism"))]
 fn main() {

@@ -13,6 +13,7 @@ pub struct OpProposerConfig {
     pub l2_output_oracle: Address,
     pub l2_to_l1_message_passer: Address,
     pub proposer_private_key: String,
+    //TODO: update this to specify DisputeGameFactory addr
 }
 
 impl OpProposerConfig {

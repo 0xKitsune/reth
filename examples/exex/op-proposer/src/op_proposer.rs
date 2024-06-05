@@ -22,6 +22,14 @@ sol! {
         function proposeL2Output(bytes32 _outputRoot, uint256 _l2BlockNumber, bytes32 _l1BlockHash, uint256 _l1BlockNumber) external payable;
         function nextBlockNumber() public view returns (uint256);
     }
+
+    #[sol(rpc)]
+    contract DisputeGameFactory {
+        type GameType is uint32;
+        type Claim is bytes32;
+        function create(GameType _gameType, Claim _rootClaim, bytes calldata _extraData) external returns (address);
+        function initBonds(GameType _gameType) external returns (uint256);
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

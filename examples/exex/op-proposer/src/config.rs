@@ -10,10 +10,15 @@ pub struct OpProposerConfig {
     pub l2_output_db: String,
     pub l1_rpc: String,
     pub rollup_rpc: String,
-    pub l2_output_oracle: Address,
+    pub proposer_type: ProposerType,
     pub l2_to_l1_message_passer: Address,
     pub proposer_private_key: String,
-    //TODO: update this to specify DisputeGameFactory addr
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum ProposerType {
+    DisputeGameFactory(DisputeGameFactoryConfig),
+    L2OutputOracle(Address),
 }
 
 impl OpProposerConfig {
@@ -34,4 +39,10 @@ impl OpProposerConfig {
 
         Ok(config)
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DisputeGameFactoryConfig {
+    pub dispute_game_factory: Address,
+    pub game_type: u32,
 }

@@ -171,6 +171,8 @@ where
 
             // Otherwise, submit the proposal to the L2OutputOracle contract
             if target_block <= safe_head {
+                // TODO: add conditional logic to propose the L2 output or create dispute game
+
                 transaction_manager.propose_l2_output(&l2_output_oracle, l2_output).await?;
             }
         }

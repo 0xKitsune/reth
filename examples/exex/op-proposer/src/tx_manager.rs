@@ -13,43 +13,30 @@ use crate::op_proposer::{
     L2OutputOracle::L2OutputOracleInstance,
 };
 
-pub struct TxManager<T, N, P>
-where
-    T: Transport + Clone,
-    N: Network,
-    P: Provider<T, N>,
-{
+pub struct TxManager {
     // Hashset to keep track of which L2Outputs have been proposed, keyed by l2_block_number
     pub pending_transactions: Arc<Mutex<HashSet<u64>>>,
     pub pending_transaction_tx: Sender<(u64, PendingTransaction)>,
-    pub l2_output_oracle: Arc<L2OutputOracleInstance<T, Arc<P>, N>>,
 }
 
-impl<T, N, P> TxManager<T, N, P>
-where
-    T: Transport + Clone,
-    N: Network,
-    P: Provider<T, N>,
-{
-    pub fn new(
-        l2_output: Arc<L2OutputOracleInstance<T, Arc<P>, N>>,
-        pending_transaction_tx: Sender<(u64, PendingTransaction)>,
-    ) -> Self {
-        Self {
-            pending_transactions: Arc::new(Mutex::new(HashSet::new())),
-            l2_output_oracle: l2_output,
-            pending_transaction_tx,
-        }
+impl TxManager {
+    pub fn new(pending_transaction_tx: Sender<(u64, PendingTransaction)>) -> Self {
+        Self { pending_transactions: Arc::new(Mutex::new(HashSet::new())), pending_transaction_tx }
     }
 
     /// Propose an L2Output to the L2OutputOracle contract. Pending transactions are added to the
     /// `pending_transactions` HashSet and the TxManager will wait for the transaction to complete
     /// asynchronously.
-    pub async fn propose_l2_output(
+    pub async fn propose_l2_output<T, P, N>(
         &mut self,
         l2_output_oracle: &L2OutputOracleInstance<T, Arc<P>, N>,
         l2_output: L2Output,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<()>
+    where
+        T: Transport + Clone,
+        N: Network,
+        P: Provider<T, N>,
+    {
         self.pending_transactions.lock().insert(l2_output.l2_block_number);
 
         // Submit a transaction to propose the L2Output to the L2OutputOracle contract
@@ -78,13 +65,18 @@ where
         Ok(())
     }
 
-    pub async fn create_dispute_game(
+    pub async fn create_dispute_game<T, P, N>(
         &mut self,
         dispute_game_factory: &DisputeGameFactoryInstance<T, Arc<P>, N>,
         game_type: u32,
         root_claim: B256,
         l2_block_number: u64,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<()>
+    where
+        T: Transport + Clone,
+        N: Network,
+        P: Provider<T, N>,
+    {
         self.pending_transactions.lock().insert(l2_block_number);
 
         let init_bond = dispute_game_factory.initBonds(game_type).call().await?;

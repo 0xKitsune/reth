@@ -12,13 +12,14 @@ pub struct OpProposerConfig {
     pub rollup_rpc: String,
     pub proposer_type: ProposerType,
     pub l2_to_l1_message_passer: Address,
+    pub l2_output_oracle: Address,
     pub proposer_private_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub enum ProposerType {
     DisputeGameFactory(DisputeGameFactoryConfig),
-    L2OutputOracle(Address),
+    L2OutputOracle,
 }
 
 impl OpProposerConfig {

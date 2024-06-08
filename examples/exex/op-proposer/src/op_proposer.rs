@@ -1,6 +1,10 @@
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 
-use crate::{db::L2OutputDb, tx_manager::TxManager};
+use crate::{
+    config::{DisputeGameFactoryConfig, ProposerType},
+    db::L2OutputDb,
+    tx_manager::TxManager,
+};
 use alloy_network::Network;
 use alloy_primitives::{Address, FixedBytes};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -13,6 +17,7 @@ use reth_primitives::{BlockId, BlockNumberOrTag, B256};
 use reth_provider::{BlockNumReader, StateProviderFactory};
 use reth_tracing::tracing::info;
 use serde::Deserialize;
+use DisputeGameFactory::DisputeGameFactoryInstance;
 
 use self::L2OutputOracle::L2OutputOracleInstance;
 
@@ -116,13 +121,24 @@ where
         mut ctx: ExExContext<Node>,
         mut l2_output_db: L2OutputDb,
         l2_output_oracle: Arc<L2OutputOracleInstance<T, Arc<P>, N>>,
-        mut transaction_manager: TxManager<T, N, P>,
+        proposer_type: ProposerType,
+        mut transaction_manager: TxManager,
     ) -> eyre::Result<()> {
         let l2_provider = ctx.provider().clone();
         let rollup_provider = Arc::new(ProviderBuilder::new().with_recommended_fillers().on_http(
             self.rollup_provider.parse().expect("Could not parse rollup provider endpoint"),
         ));
 
+        let dispute_game_factory = match proposer_type {
+            ProposerType::DisputeGameFactory(DisputeGameFactoryConfig {
+                dispute_game_factory,
+                ..
+            }) => Some(Arc::new(DisputeGameFactoryInstance::new(
+                dispute_game_factory,
+                self.l1_provider.clone(),
+            ))),
+            _ => None,
+        };
         while let Some(notification) = ctx.notifications.recv().await {
             info!(?notification, "Received ExEx notification");
             handle_reorgs(&notification, &mut l2_output_db)?;
@@ -171,9 +187,24 @@ where
 
             // Otherwise, submit the proposal to the L2OutputOracle contract
             if target_block <= safe_head {
-                // TODO: add conditional logic to propose the L2 output or create dispute game
-
-                transaction_manager.propose_l2_output(&l2_output_oracle, l2_output).await?;
+                if let Some(ref dispute_game_factory) = dispute_game_factory {
+                    if let ProposerType::DisputeGameFactory(DisputeGameFactoryConfig {
+                        game_type,
+                        ..
+                    }) = proposer_type
+                    {
+                        transaction_manager
+                            .create_dispute_game(
+                                dispute_game_factory,
+                                game_type,
+                                l2_output.output_root,
+                                l2_output.l2_block_number,
+                            )
+                            .await?;
+                    }
+                } else {
+                    transaction_manager.propose_l2_output(&l2_output_oracle, l2_output).await?;
+                }
             }
         }
 

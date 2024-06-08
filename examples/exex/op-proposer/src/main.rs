@@ -49,16 +49,18 @@ async fn init_exex<Node: FullNodeComponents>(
 
     // Initialize the TxManager to manage pending transactions
     let (pending_tx, pending_rx) = tokio::sync::mpsc::channel::<(u64, PendingTransaction)>(100);
-    let mut transaction_manager = TxManager::new(l2_output_oracle.clone(), pending_tx);
+    let mut transaction_manager = TxManager::new(pending_tx);
 
     // Spawn the OpProposer and TxManager, proposing L2 outputs to L1
     let op_proposer_fut = async move {
         tokio::select! {
             _ = transaction_manager.run(pending_rx) => {
-                return Err(eyre!("Tx Manager exited early"));
+                Err(eyre!("Tx Manager exited early"))
             }
-            _ = op_proposer.run(ctx, db, l2_output_oracle, transaction_manager) => {
-                return Err(eyre!("Op Proposer exited early"));
+
+            // TODO: update the proposer to initialize the proposer instance within the run method
+            _ = op_proposer.run(ctx, db, l2_output_oracle, config.proposer_type, transaction_manager) => {
+                Err(eyre!("Op Proposer exited early"))
             }
         }
     };

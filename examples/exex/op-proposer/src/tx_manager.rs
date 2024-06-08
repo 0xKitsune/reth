@@ -3,54 +3,44 @@ use alloy_provider::{PendingTransaction, Provider};
 use alloy_transport::Transport;
 use futures::Future;
 use parking_lot::Mutex;
-use reth_primitives::U256;
+use reth_primitives::{Bytes, B256, U256};
 use reth_tracing::tracing::{info, warn};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::op_proposer::{L2Output, L2OutputOracle::L2OutputOracleInstance};
+use crate::op_proposer::{
+    DisputeGameFactory::DisputeGameFactoryInstance, L2Output,
+    L2OutputOracle::L2OutputOracleInstance,
+};
 
-pub struct TxManager<T, N, P>
-where
-    T: Transport + Clone,
-    N: Network,
-    P: Provider<T, N>,
-{
+pub struct TxManager {
     // Hashset to keep track of which L2Outputs have been proposed, keyed by l2_block_number
     pub pending_transactions: Arc<Mutex<HashSet<u64>>>,
     pub pending_transaction_tx: Sender<(u64, PendingTransaction)>,
-    pub l2_output_oracle: Arc<L2OutputOracleInstance<T, Arc<P>, N>>,
 }
 
-impl<T, N, P> TxManager<T, N, P>
-where
-    T: Transport + Clone,
-    N: Network,
-    P: Provider<T, N>,
-{
-    pub fn new(
-        l2_output: Arc<L2OutputOracleInstance<T, Arc<P>, N>>,
-        pending_transaction_tx: Sender<(u64, PendingTransaction)>,
-    ) -> Self {
-        Self {
-            pending_transactions: Arc::new(Mutex::new(HashSet::new())),
-            l2_output_oracle: l2_output,
-            pending_transaction_tx,
-        }
+impl TxManager {
+    pub fn new(pending_transaction_tx: Sender<(u64, PendingTransaction)>) -> Self {
+        Self { pending_transactions: Arc::new(Mutex::new(HashSet::new())), pending_transaction_tx }
     }
 
     /// Propose an L2Output to the L2OutputOracle contract. Pending transactions are added to the
     /// `pending_transactions` HashSet and the TxManager will wait for the transaction to complete
     /// asynchronously.
-    pub async fn propose_l2_output(
+    pub async fn propose_l2_output<T, P, N>(
         &mut self,
         l2_output_oracle: &L2OutputOracleInstance<T, Arc<P>, N>,
         l2_output: L2Output,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<()>
+    where
+        T: Transport + Clone,
+        N: Network,
+        P: Provider<T, N>,
+    {
         self.pending_transactions.lock().insert(l2_output.l2_block_number);
 
         // Submit a transaction to propose the L2Output to the L2OutputOracle contract
-        let transport_result = l2_output_oracle
+        let pending_transaction = l2_output_oracle
             .proposeL2Output(
                 l2_output.output_root,
                 U256::from(l2_output.l2_block_number),
@@ -62,7 +52,7 @@ where
             .register()
             .await?;
 
-        self.pending_transaction_tx.send((l2_output.l2_block_number, transport_result)).await?;
+        self.pending_transaction_tx.send((l2_output.l2_block_number, pending_transaction)).await?;
 
         info!(
             output_root = ?l2_output.output_root,
@@ -71,6 +61,36 @@ where
             l1_block_number = ?l2_output.l1_block_number,
             "Proposing L2Output"
         );
+
+        Ok(())
+    }
+
+    pub async fn create_dispute_game<T, P, N>(
+        &mut self,
+        dispute_game_factory: &DisputeGameFactoryInstance<T, Arc<P>, N>,
+        game_type: u32,
+        root_claim: B256,
+        l2_block_number: u64,
+    ) -> eyre::Result<()>
+    where
+        T: Transport + Clone,
+        N: Network,
+        P: Provider<T, N>,
+    {
+        self.pending_transactions.lock().insert(l2_block_number);
+
+        let init_bond = dispute_game_factory.initBonds(game_type).call().await?;
+
+        let pending_transaction = dispute_game_factory
+            .create(game_type, root_claim, Bytes::new())
+            .value(U256::from(init_bond._0))
+            .send()
+            .await?
+            .register()
+            .await?;
+
+        self.pending_transaction_tx.send((l2_block_number, pending_transaction)).await?;
+        info!(?game_type, ?root_claim, ?l2_block_number, "Creating Dispute Game");
 
         Ok(())
     }

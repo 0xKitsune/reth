@@ -2,14 +2,13 @@ use alloc::sync::Arc;
 use alloy_consensus::{
     proofs, Block, BlockBody, BlockHeader, Header, Transaction, TxReceipt, EMPTY_OMMER_ROOT_HASH,
 };
-use alloy_eips::merge::BEACON_NONCE;
+use alloy_eips::{eip2718::Encodable2718, merge::BEACON_NONCE};
 use alloy_evm::{block::BlockExecutorFactory, eth::EthBlockExecutionCtx};
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, Log};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::execute::{BlockAssembler, BlockAssemblerInput, BlockExecutionError};
 use reth_execution_types::BlockExecutionResult;
-use reth_primitives_traits::logs_bloom;
+use reth_primitives_traits::{logs_bloom, SignedTransaction};
 
 /// Block builder for Ethereum.
 #[derive(Debug, Clone)]
@@ -29,19 +28,17 @@ impl<ChainSpec> EthBlockAssembler<ChainSpec> {
 
 impl<F, ChainSpec> BlockAssembler<F> for EthBlockAssembler<ChainSpec>
 where
-    F: for<'a> BlockExecutorFactory<
-        ExecutionCtx<'a> = EthBlockExecutionCtx<'a>,
-        Transaction = TransactionSigned,
-        Receipt = Receipt,
-    >,
+    F: for<'a> BlockExecutorFactory<ExecutionCtx<'a> = EthBlockExecutionCtx<'a>>,
+    F::Transaction: SignedTransaction + Encodable2718,
+    F::Receipt: TxReceipt<Log = Log> + Encodable2718,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
-    type Block = Block<TransactionSigned>;
+    type Block = Block<F::Transaction>;
 
     fn assemble_block(
         &self,
         input: BlockAssemblerInput<'_, '_, F>,
-    ) -> Result<Block<TransactionSigned>, BlockExecutionError> {
+    ) -> Result<Block<F::Transaction>, BlockExecutionError> {
         let BlockAssemblerInput {
             evm_env,
             execution_ctx: ctx,
@@ -55,7 +52,7 @@ where
         let timestamp = evm_env.block_env.timestamp.saturating_to();
 
         let transactions_root = proofs::calculate_transaction_root(&transactions);
-        let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
+        let receipts_root = proofs::calculate_receipt_root(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
 
         let withdrawals = self

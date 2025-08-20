@@ -40,7 +40,7 @@ use std::{
     ops::Bound::{Excluded, Unbounded},
     sync::Arc,
 };
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 // TODO: Inlined diagram due to a bug in aquamarine library, should become an include when it's
@@ -1828,7 +1828,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
         // Current tx does not exceed block gas limit after ensure_valid check
         state.insert(TxState::NOT_TOO_MUCH_GAS);
 
-        info!("Does not exceed block gas limit: {tx_hash:?}");
+        info!(target: "txpool", hash = %tx_hash, "transaction does not exceed block gas limit");
 
         // identifier of the ancestor transaction, will be None if the transaction is the next tx of
         // the sender
@@ -1858,7 +1858,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
         // If there's no ancestor tx then this is the next transaction.
         if ancestor.is_none() {
-            info!("No Nonce gaps, parked ancestors: {tx_hash:?}");
+            info!(target: "txpool", hash = %tx_hash, "transaction has no nonce gaps or parked ancestors");
 
             state.insert(TxState::NO_NONCE_GAPS);
             state.insert(TxState::NO_PARKED_ANCESTORS);
@@ -1875,7 +1875,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             return Err(InsertErr::FeeCapBelowMinimumProtocolFeeCap { transaction, fee_cap })
         }
         if fee_cap >= self.pending_fees.base_fee as u128 {
-            info!("Feecap > pending_fees.base: {tx_hash:?}");
+            info!(target: "txpool", hash = %tx_hash, fee_cap = %fee_cap, pending_base_fee = %self.pending_fees.base_fee, "transaction fee cap exceeds pending base fee");
             state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
         }
 
@@ -1893,6 +1893,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
         match self.txs.entry(*transaction.id()) {
             Entry::Vacant(entry) => {
                 // Insert the transaction in both maps
+                info!(target: "txpool", hash = %tx_hash, sender = ?inserted_tx_id.sender, nonce = %transaction.nonce(), "inserting new transaction into pool");
                 self.by_hash.insert(*pool_tx.transaction.hash(), pool_tx.transaction.clone());
                 entry.insert(pool_tx);
             }
@@ -1910,6 +1911,8 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 }
                 let new_hash = *pool_tx.transaction.hash();
                 let new_transaction = pool_tx.transaction.clone();
+                let replaced_hash = *replaced.transaction.hash();
+                info!(target: "txpool", new_hash = %new_hash, replaced_hash = %replaced_hash, sender = ?inserted_tx_id.sender, nonce = %transaction.nonce(), "replacing existing transaction in pool");
                 let replaced = entry.insert(pool_tx);
                 self.by_hash.remove(replaced.transaction.hash());
                 self.by_hash.insert(new_hash, new_transaction);
@@ -1959,14 +1962,17 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 cumulative_cost = tx.next_cumulative_cost();
 
                 if cumulative_cost > on_chain_balance {
+                    warn!(target: "txpool", hash = %id.hash, sender = ?id.sender, cumulative_cost = %cumulative_cost, on_chain_balance = %on_chain_balance, "removing ENOUGH_BALANCE state: insufficient funds");
                     // sender lacks sufficient funds to pay for this transaction
                     tx.state.remove(TxState::ENOUGH_BALANCE);
                 } else {
+                    info!(target: "txpool", hash = %id.hash, sender = ?id.sender, cumulative_cost = %cumulative_cost, on_chain_balance = %on_chain_balance, "transaction has sufficient balance");
                     tx.state.insert(TxState::ENOUGH_BALANCE);
                 }
 
                 // Update ancestor condition.
                 if has_parked_ancestor {
+                    warn!(target: "txpool", hash = %id.hash, sender = ?id.sender, nonce = %id.nonce, "transaction has parked ancestor");
                     tx.state.remove(TxState::NO_PARKED_ANCESTORS);
                 } else {
                     tx.state.insert(TxState::NO_PARKED_ANCESTORS);
@@ -2002,6 +2008,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
         self.update_size_metrics();
 
+        info!(target: "txpool", hash = %tx_hash, sender = ?inserted_tx_id.sender, nonce = %transaction.nonce(), subpool = ?state.into(), "successfully inserted transaction into pool");
         Ok(InsertOk { transaction, move_to: state.into(), state, replaced_tx, updates })
     }
 

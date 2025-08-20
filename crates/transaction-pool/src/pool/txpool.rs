@@ -40,7 +40,7 @@ use std::{
     ops::Bound::{Excluded, Unbounded},
     sync::Arc,
 };
-use tracing::trace;
+use tracing::{info, trace};
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 // TODO: Inlined diagram due to a bug in aquamarine library, should become an include when it's
@@ -1817,6 +1817,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
     ) -> InsertResult<T> {
         assert!(on_chain_nonce <= transaction.nonce(), "Invalid transaction");
 
+        let tx_hash = *transaction.hash();
         let mut transaction = self.ensure_valid(transaction, on_chain_nonce)?;
 
         let inserted_tx_id = *transaction.id();
@@ -1826,6 +1827,8 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
         // Current tx does not exceed block gas limit after ensure_valid check
         state.insert(TxState::NOT_TOO_MUCH_GAS);
+
+        info!("Does not exceed block gas limit: {tx_hash:?}");
 
         // identifier of the ancestor transaction, will be None if the transaction is the next tx of
         // the sender
@@ -1855,9 +1858,15 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
         // If there's no ancestor tx then this is the next transaction.
         if ancestor.is_none() {
+            info!("No Nonce gaps, parked ancestors: {tx_hash:?}");
+
             state.insert(TxState::NO_NONCE_GAPS);
             state.insert(TxState::NO_PARKED_ANCESTORS);
         }
+        // let state = TxState::NO_PARKED_ANCESTORS |
+        //     TxState::NO_NONCE_GAPS |
+        //     TxState::NOT_TOO_MUCH_GAS |
+        //     TxState::ENOUGH_FEE_CAP_BLOCK;
 
         // Check dynamic fee
         let fee_cap = transaction.max_fee_per_gas();
@@ -1866,6 +1875,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             return Err(InsertErr::FeeCapBelowMinimumProtocolFeeCap { transaction, fee_cap })
         }
         if fee_cap >= self.pending_fees.base_fee as u128 {
+            info!("Feecap > pending_fees.base: {tx_hash:?}");
             state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
         }
 

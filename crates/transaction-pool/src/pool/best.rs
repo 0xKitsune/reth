@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::broadcast::{error::TryRecvError, Receiver};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// An iterator that returns transactions that can be executed on the current state (*best*
 /// transactions).
@@ -56,7 +56,7 @@ impl<T: TransactionOrdering> Iterator for BestTransactionsWithFees<T> {
             // If both the base fee and blob fee (if applicable for EIP-4844) are satisfied, return
             // the transaction
 
-            debug!(
+            warn!(
                 target: "txpool::best_transactions",
                 tx_hash = ?best.transaction.hash(),
                 max_fee_per_gas = %best.transaction.max_fee_per_gas(),

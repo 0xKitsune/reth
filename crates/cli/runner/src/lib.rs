@@ -10,8 +10,9 @@
 
 //! Entrypoint for running commands.
 
-use reth_tasks::{PanickedTaskError, TaskExecutor};
-use std::{future::Future, pin::pin, sync::mpsc, time::Duration};
+use futures_util::FutureExt;
+use reth_tasks::{ExitReason, PanickedTaskError, TaskExecutor};
+use std::{future::Future, panic::AssertUnwindSafe, pin::pin, sync::mpsc, time::Duration};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
@@ -80,21 +81,21 @@ impl CliRunner {
     {
         let (context, task_manager_handle) = cli_context(&self.runtime);
 
-        // Executes the command until it finished or ctrl-c was fired
-        let command_res = self.runtime.handle().block_on(run_to_completion_or_panic(
-            task_manager_handle,
-            run_until_ctrl_c(command(context)),
-        ));
+        let (reason, command_res) = self
+            .runtime
+            .handle()
+            .block_on(run_command_to_exit(task_manager_handle, command(context)));
+
+        self.run_pre_shutdown_hook(reason);
 
         if let Err(err) = &command_res {
             error!(target: "reth::cli", %err, "shutting down due to error");
         } else {
             debug!(target: "reth::cli", "shutting down gracefully");
-            // after the command has finished or exit signal was received we shutdown the
-            // runtime which fires the shutdown signal to all tasks spawned via the task
-            // executor and awaiting on tasks spawned with graceful shutdown
-            self.runtime.graceful_shutdown_with_timeout(self.config.graceful_shutdown_timeout);
         }
+        // Preserve the same bounded drain for signal, command, and panic exits. The runtime still
+        // owns global cancellation until the pre-shutdown hook has returned.
+        self.runtime.graceful_shutdown_with_timeout(self.config.graceful_shutdown_timeout);
 
         runtime_shutdown(self.runtime, true);
 
@@ -124,24 +125,40 @@ impl CliRunner {
         let handle2 = handle.clone();
         let command_handle = handle.spawn_blocking(move || handle2.block_on(command(context)));
 
-        // Wait for the command to complete or ctrl-c
-        let command_res = self.runtime.handle().block_on(run_to_completion_or_panic(
-            task_manager_handle,
-            run_until_ctrl_c(
-                async move { command_handle.await.expect("Failed to join blocking task") },
-            ),
-        ));
+        let (reason, command_res) =
+            self.runtime.handle().block_on(run_command_to_exit(task_manager_handle, async move {
+                command_handle.await.expect("Failed to join blocking task")
+            }));
+
+        self.run_pre_shutdown_hook(reason);
 
         if let Err(err) = &command_res {
             error!(target: "reth::cli", %err, "shutting down due to error");
         } else {
             debug!(target: "reth::cli", "shutting down gracefully");
-            self.runtime.graceful_shutdown_with_timeout(self.config.graceful_shutdown_timeout);
         }
+        self.runtime.graceful_shutdown_with_timeout(self.config.graceful_shutdown_timeout);
 
         runtime_shutdown(self.runtime, true);
 
         command_res
+    }
+
+    fn run_pre_shutdown_hook(&self, reason: ExitReason) {
+        let hook = self.runtime.pre_shutdown_hook_registrar();
+        let result = self.runtime.handle().block_on(async {
+            tokio::time::timeout(
+                self.config.pre_shutdown_hook_timeout,
+                AssertUnwindSafe(hook.invoke(reason)).catch_unwind(),
+            )
+            .await
+        });
+        match result {
+            Ok(Ok(true)) => debug!(target: "reth::cli", ?reason, "pre-shutdown hook completed"),
+            Ok(Ok(false)) => {}
+            Ok(Err(_)) => error!(target: "reth::cli", ?reason, "pre-shutdown hook panicked"),
+            Err(_) => error!(target: "reth::cli", ?reason, "pre-shutdown hook timed out"),
+        }
     }
 
     /// Executes a regular future until completion or until external signal received.
@@ -204,6 +221,8 @@ pub struct CliRunnerConfig {
     /// After the command completes, this is the maximum time to wait for spawned tasks
     /// to finish before forcefully terminating them.
     pub graceful_shutdown_timeout: Duration,
+    /// Maximum time to wait for an optional hook before global task cancellation.
+    pub pre_shutdown_hook_timeout: Duration,
 }
 
 impl Default for CliRunnerConfig {
@@ -215,7 +234,10 @@ impl Default for CliRunnerConfig {
 impl CliRunnerConfig {
     /// Creates a new config with default values.
     pub const fn new() -> Self {
-        Self { graceful_shutdown_timeout: DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT }
+        Self {
+            graceful_shutdown_timeout: DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT,
+            pre_shutdown_hook_timeout: Duration::from_secs(15),
+        }
     }
 
     /// Sets the graceful shutdown timeout.
@@ -223,29 +245,66 @@ impl CliRunnerConfig {
         self.graceful_shutdown_timeout = timeout;
         self
     }
+
+    /// Sets the pre-shutdown hook timeout.
+    pub const fn with_pre_shutdown_hook_timeout(mut self, timeout: Duration) -> Self {
+        self.pre_shutdown_hook_timeout = timeout;
+        self
+    }
 }
 
-/// Runs the given future to completion or until a critical task panicked.
-///
-/// Returns the error if a task panicked, or the given future returned an error.
-async fn run_to_completion_or_panic<F, E>(
+async fn run_command_to_exit<F, E>(
     task_manager_handle: JoinHandle<Result<(), PanickedTaskError>>,
     fut: F,
-) -> Result<(), E>
+) -> (ExitReason, Result<(), E>)
 where
     F: Future<Output = Result<(), E>>,
-    E: Send + Sync + From<reth_tasks::PanickedTaskError> + 'static,
+    E: Send + Sync + From<std::io::Error> + From<reth_tasks::PanickedTaskError> + 'static,
 {
-    let fut = pin!(fut);
+    let ctrl_c = pin!(tokio::signal::ctrl_c());
+    let command = pin!(AssertUnwindSafe(fut).catch_unwind());
+    let task_manager_handle = pin!(task_manager_handle);
+
+    #[cfg(unix)]
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(signal) => signal,
+        Err(err) => return (ExitReason::CommandError, Err(err.into())),
+    };
+    #[cfg(unix)]
+    let sigterm = pin!(async move { sigterm.recv().await });
+    #[cfg(not(unix))]
+    let sigterm = pin!(std::future::pending::<()>());
+
     tokio::select! {
-        task_manager_result = task_manager_handle => {
-            if let Ok(Err(panicked_error)) = task_manager_result {
-                return Err(panicked_error.into());
+        result = task_manager_handle => match result {
+            Ok(Err(err)) => (ExitReason::CriticalTaskPanic, Err(err.into())),
+            Ok(Ok(())) => (ExitReason::CommandCompleted, Ok(())),
+            Err(err) => {
+                let panic = PanickedTaskError::new("task-manager", Box::new(err.to_string()));
+                (ExitReason::CriticalTaskPanic, Err(panic.into()))
             }
         },
-        res = fut => res?,
+        result = command => match result {
+            Ok(Ok(())) => (ExitReason::CommandCompleted, Ok(())),
+            Ok(Err(err)) => (ExitReason::CommandError, Err(err)),
+            Err(payload) => {
+                let panic = PanickedTaskError::new("command", payload);
+                (ExitReason::CommandPanic, Err(panic.into()))
+            }
+        },
+        result = ctrl_c => match result {
+            Ok(()) => {
+                info!(target: "reth::cli", "Received ctrl-c");
+                (ExitReason::SigInt, Ok(()))
+            }
+            Err(err) => (ExitReason::CommandError, Err(err.into())),
+        },
+        _ = sigterm => {
+            info!(target: "reth::cli", "Received SIGTERM");
+            (ExitReason::SigTerm, Ok(()))
+        },
     }
-    Ok(())
 }
 
 /// Runs the future to completion or until:

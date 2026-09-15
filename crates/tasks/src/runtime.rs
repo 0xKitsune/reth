@@ -12,7 +12,7 @@ use crate::{
     metrics::{IncCounterOnDrop, TaskExecutorMetrics},
     shutdown::{GracefulShutdown, GracefulShutdownGuard, Shutdown},
     worker_map::WorkerMap,
-    PanickedTaskError, TaskEvent, TaskManager,
+    PanickedTaskError, PreShutdownHookRegistrar, TaskEvent, TaskManager, TaskManagerParts,
 };
 use futures_util::{future::select, Future, FutureExt, TryFutureExt};
 #[cfg(feature = "rayon")]
@@ -262,6 +262,11 @@ struct RuntimeInner {
     handle: Handle,
     /// Receiver of the shutdown signal.
     on_shutdown: Shutdown,
+    /// Sender retained outside the task manager so a critical-task panic does not cancel tasks
+    /// before the CLI runner invokes the pre-shutdown hook.
+    _shutdown_signal: Arc<Mutex<Option<crate::shutdown::Signal>>>,
+    /// One-shot hook registration shared by every clone of this runtime.
+    pre_shutdown_hook: PreShutdownHookRegistrar,
     /// Sender half for sending task events to the [`TaskManager`].
     task_events_tx: UnboundedSender<TaskEvent>,
     /// Task executor metrics.
@@ -446,6 +451,11 @@ impl Runtime {
     /// Returns the receiver of the shutdown signal.
     pub fn on_shutdown_signal(&self) -> &Shutdown {
         &self.0.on_shutdown
+    }
+
+    /// Returns the runtime-owned one-shot pre-shutdown hook registrar.
+    pub fn pre_shutdown_hook_registrar(&self) -> PreShutdownHookRegistrar {
+        self.0.pre_shutdown_hook.clone()
     }
 
     /// Spawns a future on the tokio runtime depending on the [`TaskKind`].
@@ -824,7 +834,9 @@ impl Runtime {
     }
 
     fn do_graceful_shutdown(&self, timeout: Option<Duration>) -> bool {
-        let _ = self.0.task_events_tx.send(TaskEvent::GracefulShutdown);
+        if let Some(signal) = self.0._shutdown_signal.lock().expect("poisoned").take() {
+            signal.fire();
+        }
         let deadline = timeout.map(|t| Instant::now() + t);
         while self.0.graceful_tasks.load(Ordering::SeqCst) > 0 {
             if deadline.is_some_and(|d| Instant::now() > d) {
@@ -881,8 +893,13 @@ impl RuntimeBuilder {
             TokioConfig::ExistingHandle(h) => (None, h.clone()),
         };
 
-        let (task_manager, on_shutdown, task_events_tx, graceful_tasks) =
-            TaskManager::new_parts(handle.clone());
+        let TaskManagerParts {
+            manager: task_manager,
+            on_shutdown,
+            signal: shutdown_signal,
+            events: task_events_tx,
+            graceful_tasks,
+        } = TaskManager::new_parts(handle.clone());
 
         #[cfg(feature = "rayon")]
         let (
@@ -984,6 +1001,8 @@ impl RuntimeBuilder {
             _tokio_runtime: owned_runtime,
             handle,
             on_shutdown,
+            _shutdown_signal: shutdown_signal,
+            pre_shutdown_hook: PreShutdownHookRegistrar::default(),
             task_events_tx,
             metrics: Default::default(),
             graceful_tasks,

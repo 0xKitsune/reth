@@ -16,10 +16,11 @@ use crate::shutdown::{signal, Shutdown, Signal};
 use std::{
     any::Any,
     fmt::{Display, Formatter},
+    future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     task::{ready, Context, Poll},
     thread,
@@ -55,6 +56,81 @@ pub use runtime::{Runtime, RuntimeBuildError, RuntimeBuilder, RuntimeConfig, Tok
 
 /// A [`TaskExecutor`] is now an alias for [`Runtime`].
 pub type TaskExecutor = Runtime;
+
+/// The first recoverable reason that caused a CLI command to leave its run loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// The process received SIGINT.
+    SigInt,
+    /// The process received SIGTERM.
+    SigTerm,
+    /// The command returned successfully.
+    CommandCompleted,
+    /// The command returned an error.
+    CommandError,
+    /// The command future unwound.
+    CommandPanic,
+    /// A task registered as critical unwound.
+    CriticalTaskPanic,
+}
+
+type PreShutdownHook = Box<
+    dyn FnOnce(ExitReason) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static,
+>;
+
+#[derive(Default)]
+struct PreShutdownHookState {
+    hook: Mutex<Option<PreShutdownHook>>,
+    invoked: AtomicBool,
+}
+
+/// Runtime-owned, one-shot registration point for work that must run before global cancellation.
+#[derive(Clone, Default)]
+pub struct PreShutdownHookRegistrar(Arc<PreShutdownHookState>);
+
+impl std::fmt::Debug for PreShutdownHookRegistrar {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreShutdownHookRegistrar")
+            .field("registered", &self.0.hook.lock().expect("poisoned").is_some())
+            .field("invoked", &self.0.invoked.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl PreShutdownHookRegistrar {
+    /// Registers the runtime's only pre-shutdown hook.
+    pub fn register<F, Fut>(&self, hook: F) -> Result<(), PreShutdownHookRegistrationError>
+    where
+        F: FnOnce(ExitReason) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        if self.0.invoked.load(Ordering::Acquire) {
+            return Err(PreShutdownHookRegistrationError);
+        }
+        let mut slot = self.0.hook.lock().expect("poisoned");
+        if slot.is_some() {
+            return Err(PreShutdownHookRegistrationError);
+        }
+        *slot = Some(Box::new(move |reason| Box::pin(hook(reason))));
+        Ok(())
+    }
+
+    /// Takes and invokes the registered hook at most once.
+    pub async fn invoke(&self, reason: ExitReason) -> bool {
+        if self.0.invoked.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let hook = self.0.hook.lock().expect("poisoned").take();
+        let Some(hook) = hook else { return false };
+        hook(reason).await;
+        true
+    }
+}
+
+/// Returned when a runtime already has a hook or has started shutting down.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("a pre-shutdown hook is already registered or has already run")]
+pub struct PreShutdownHookRegistrationError;
 
 /// Spawns an OS thread with the current tokio runtime context propagated.
 ///
@@ -118,10 +194,18 @@ pub struct TaskManager {
     /// The [Signal] to fire when all tasks should be shutdown.
     ///
     /// This is fired when dropped.
-    signal: Option<Signal>,
+    signal: Arc<Mutex<Option<Signal>>>,
     /// How many [`GracefulShutdown`](crate::shutdown::GracefulShutdown) tasks are currently
     /// active.
     graceful_tasks: Arc<AtomicUsize>,
+}
+
+pub(crate) struct TaskManagerParts {
+    pub manager: TaskManager,
+    pub on_shutdown: Shutdown,
+    pub signal: Arc<Mutex<Option<Signal>>>,
+    pub events: UnboundedSender<TaskEvent>,
+    pub graceful_tasks: Arc<AtomicUsize>,
 }
 
 // === impl TaskManager ===
@@ -129,18 +213,17 @@ pub struct TaskManager {
 impl TaskManager {
     /// Create a new [`TaskManager`] without an associated [`Runtime`], returning
     /// the shutdown/event primitives for [`RuntimeBuilder`] to wire up.
-    pub(crate) fn new_parts(
-        _handle: Handle,
-    ) -> (Self, Shutdown, UnboundedSender<TaskEvent>, Arc<AtomicUsize>) {
+    pub(crate) fn new_parts(_handle: Handle) -> TaskManagerParts {
         let (task_events_tx, task_events_rx) = unbounded_channel();
         let (signal, on_shutdown) = signal();
+        let signal = Arc::new(Mutex::new(Some(signal)));
         let graceful_tasks = Arc::new(AtomicUsize::new(0));
         let manager = Self {
             task_events_rx,
-            signal: Some(signal),
+            signal: Arc::clone(&signal),
             graceful_tasks: Arc::clone(&graceful_tasks),
         };
-        (manager, on_shutdown, task_events_tx, graceful_tasks)
+        TaskManagerParts { manager, on_shutdown, signal, events: task_events_tx, graceful_tasks }
     }
 
     /// Fires the shutdown signal and awaits until all tasks are shutdown.
@@ -156,7 +239,9 @@ impl TaskManager {
     }
 
     fn do_graceful_shutdown(self, timeout: Option<std::time::Duration>) -> bool {
-        drop(self.signal);
+        if let Some(signal) = self.signal.lock().expect("poisoned").take() {
+            signal.fire();
+        }
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
         while self.graceful_tasks.load(Ordering::SeqCst) > 0 {
             if deadline.is_some_and(|d| std::time::Instant::now() > d) {
@@ -180,7 +265,7 @@ impl std::future::Future for TaskManager {
         match ready!(self.as_mut().get_mut().task_events_rx.poll_recv(cx)) {
             Some(TaskEvent::Panic(err)) => Poll::Ready(Err(err)),
             Some(TaskEvent::GracefulShutdown) | None => {
-                if let Some(signal) = self.get_mut().signal.take() {
+                if let Some(signal) = self.signal.lock().expect("poisoned").take() {
                     signal.fire();
                 }
                 Poll::Ready(Ok(()))
@@ -208,7 +293,8 @@ impl Display for PanickedTaskError {
 }
 
 impl PanickedTaskError {
-    pub(crate) fn new(task_name: &'static str, error: Box<dyn Any>) -> Self {
+    /// Creates an error from a caught unwind payload.
+    pub fn new(task_name: &'static str, error: Box<dyn Any + Send>) -> Self {
         let error = match error.downcast::<String>() {
             Ok(value) => Some(*value),
             Err(error) => match error.downcast::<&str>() {
@@ -370,5 +456,46 @@ mod tests {
         assert!(task_join_result.is_ok());
 
         assert!(task_did_shutdown_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pre_shutdown_hook_registers_and_runs_once() {
+        let rt = Runtime::test();
+        let registrar = rt.pre_shutdown_hook_registrar();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls = Arc::clone(&calls);
+        registrar
+            .register(move |reason| async move {
+                assert_eq!(reason, ExitReason::SigTerm);
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+
+        assert!(registrar.register(|_| async {}).is_err());
+        assert!(rt.handle().block_on(registrar.invoke(ExitReason::SigTerm)));
+        assert!(!rt.handle().block_on(registrar.invoke(ExitReason::SigInt)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn critical_panic_does_not_cancel_surviving_tasks_before_shutdown() {
+        let rt = Runtime::test();
+        let manager = rt.take_task_manager_handle().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::clone(&cancelled);
+        let survivor = rt.spawn_with_signal(async move |shutdown| {
+            shutdown.await;
+            task_cancelled.store(true, Ordering::SeqCst);
+        });
+        rt.spawn_critical_task("panic", async { panic!("expected") });
+
+        let result = rt.handle().block_on(manager).unwrap();
+        assert!(result.is_err());
+        rt.handle().block_on(tokio::task::yield_now());
+        assert!(!cancelled.load(Ordering::SeqCst));
+
+        rt.graceful_shutdown();
+        rt.handle().block_on(survivor).unwrap();
+        assert!(cancelled.load(Ordering::SeqCst));
     }
 }
